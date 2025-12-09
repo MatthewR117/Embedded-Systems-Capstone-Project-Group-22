@@ -1,4 +1,4 @@
-//Gavin Tunnell
+//Group-22
 //12-09-25
 //ESP32 Firebase/STM32 Interface
 //Objective: Read encoded voltage, current, power, and energy from STM32 and send it to Firebase,
