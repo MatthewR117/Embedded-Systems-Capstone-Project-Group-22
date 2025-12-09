@@ -11,7 +11,7 @@ const char *FIREBASE_AUTH_SUFFIX = "";
 WiFiClientSecure g_client;
 
 const int UART2_RX_PIN = 16;  // ESP32 RX2 (connect to STM32 TX6)
-const int UART2_TX_PIN = 17;  // ESP32 TX2 (connect to STM32 RX6);
+const int UART2_TX_PIN = 17;  // ESP32 TX2 (connect to STM32 RX6)
 
 // Relay polling
 unsigned long g_lastRelayPollMs = 0;
@@ -20,7 +20,7 @@ unsigned char g_relayCmdByte = 0;
 
 // Relay Firebase failure handling
 short g_fbFailCount = 0;
-const short g_fbFailThreshold = 5;  // lower threshold so we recover faster
+const short g_fbFailThreshold = 10;
 
 // Telemetry receive buffer (16 bytes from STM32, header stripped)
 unsigned char g_telemBuf[16];
@@ -60,34 +60,22 @@ void connectWiFi(void) {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  Serial.print("[WIFI] Connecting");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
-    Serial.print(".");
   }
-  Serial.println();
-  Serial.print("[WIFI] Connected, IP: ");
-  Serial.println(WiFi.localIP());
 }
 
 /*************** Firebase helpers ***************/
 bool fbGetInt(const char *path, long *valueOut) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[FB] WiFi not connected in fbGetInt, reconnecting");
     connectWiFi();
   }
 
   HTTPClient http;
   String url = String(FIREBASE_HOST) + String(path) + String(FIREBASE_AUTH_SUFFIX);
 
-  Serial.print("[FB] GET ");
-  Serial.println(url);
-
   http.begin(g_client, url);
   int code = http.GET();
-
-  Serial.print("[FB] HTTP code: ");
-  Serial.println(code);
 
   if (code != HTTP_CODE_OK) {
     http.end();
@@ -98,18 +86,11 @@ bool fbGetInt(const char *path, long *valueOut) {
   http.end();
 
   body.trim();
-  Serial.print("[FB] Body: '");
-  Serial.print(body);
-  Serial.println("'");
-
   if (body.length() == 0 || body == "null") {
     return false;
   }
 
   long v = body.toInt();
-  Serial.print("[FB] Parsed int: ");
-  Serial.println(v);
-
   *valueOut = v;
   return true;
 }
@@ -148,42 +129,51 @@ bool fbPatchTelemetry(unsigned long vWord,
   return (code >= 200 && code < 300);
 }
 
-/*************** Relay handling with diagnostics ***************/
+/*************** Relay handling with auto-recover ***************/
 void handleRelay(void) {
   unsigned long now = millis();
+
+  // Check if enough time has passed to poll Firebase again
   if (now - g_lastRelayPollMs < g_relayPollIntervalMs) {
     return;
   }
+  
   g_lastRelayPollMs = now;
-
+  
   long relaysValue = 0;
-  if (!fbGetInt("/iot_data/relays.json", &relaysValue)) {
+  bool relaySuccess = fbGetInt("/iot_data/relays.json", &relaysValue);
+
+  // If the data fetch fails, increment the failure count
+  if (!relaySuccess) {
     g_fbFailCount++;
 
-    Serial.print("[RELAY] fbGetInt FAILED, count=");
-    Serial.println(g_fbFailCount);
-
     if (g_fbFailCount >= g_fbFailThreshold) {
-      Serial.println("[RELAY] fbGetInt failed repeatedly, resetting WiFi and client");
+      // If we've hit the failure threshold, reset WiFi and retry connection
+      Serial.println("[RELAY] fbGetInt failed repeatedly, resetting WiFi");
       WiFi.disconnect(true);
-      delay(200);
-      connectWiFi();
-      g_client.stop();   // reset TLS client
-      g_fbFailCount = 0;
+      delay(100);
+      connectWiFi();  // Reconnect Wi-Fi
+      g_fbFailCount = 0;  // Reset failure count
     }
+
+    // Exit early and avoid further processing if relay fetch fails
     return;
   }
 
+  // If successful, reset failure count
   g_fbFailCount = 0;
 
+  // Update relay command byte based on Firebase data
   g_relayCmdByte = (unsigned char)(relaysValue & 0xFF);
 
+  // Debugging output
   Serial.print("[RELAY] Firebase relays int = ");
   Serial.println(relaysValue);
   Serial.print("[RELAY] UART cmd byte = 0x");
   if (g_relayCmdByte < 0x10) Serial.print("0");
   Serial.println(g_relayCmdByte, HEX);
 
+  // Send the updated command byte to the STM32 via UART
   Serial2.write(g_relayCmdByte);
 }
 
