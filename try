@@ -62,11 +62,18 @@ void connectWiFi(void) {
   }
 }
 
+void disconnectWiFi(void) {
+  WiFi.disconnect();                      // Disconnect Wi-Fi
+  delay(500);                             // Allow time for disconnection
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);   // Reconnect Wi-Fi
+  while (WiFi.status() != WL_CONNECTED) { // Wait until Wi-Fi reconnects
+    delay(500);
+  }
+}
+
 /*************** Firebase helpers ***************/
 bool fbGetInt(const char *path, long *valueOut) {
-  if (WiFi.status() != WL_CONNECTED) {    // If Wi-Fi is disconnected reconnect
-    connectWiFi();
-  }
+  disconnectWiFi();    // Disconnect and reconnect to Wi-Fi for every Firebase poll
 
   HTTPClient http;                        // Create HTTP client
   String url = String(FIREBASE_HOST) + String(path) + String(FIREBASE_AUTH_SUFFIX); // Build full URL
@@ -103,9 +110,7 @@ bool fbPatchTelemetry(unsigned long vWord,
                       unsigned long cWord,
                       unsigned long wWord,
                       unsigned long whWord) {
-  if (WiFi.status() != WL_CONNECTED) {    // If Wi-Fi dropped reconnect
-    connectWiFi();
-  }
+  disconnectWiFi();    // Disconnect and reconnect to Wi-Fi for every Firebase poll
 
   HTTPClient http;                        // Create HTTP client
   String path = "/iot_data.json";         // Path that stores telemetry in Firebase
