@@ -3,4 +3,4 @@
 
 Link to flutter code:
 
-https://github.com/GavinTunnell/Capstone
+https://github.com/GavinTunnell/Capstone-Flutter-App
