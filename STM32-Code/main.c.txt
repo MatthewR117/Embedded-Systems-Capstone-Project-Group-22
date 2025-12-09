@@ -1,0 +1,548 @@
+//Group-22
+//12-09-25
+//STM32 PZEM/ESP32 Interface
+//Objective: Read voltage, current, and power from 3 PZEM modules and send the data to an ESP32 which sends it to a Firebase server and then to a Flutter application
+
+#include "main.h"
+
+TIM_HandleTypeDef htim1;    //define timer that will be used to clock the state machines
+
+UART_HandleTypeDef huart1;  //define uart that will communicate with PZEM 1
+UART_HandleTypeDef huart5;  //define uart that will communicate with PZEM 2
+UART_HandleTypeDef huart3;  //define uart that will communicate with PZEM 3
+UART_HandleTypeDef huart6;  //define uart that will communicate with the ESP32
+
+//function prototypes for clock, gpio, uart, timer, and state machines
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_UART5_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_USART6_UART_Init(void);
+static void MX_TIM1_Init(void);
+void UState_Machine(void);
+void CState_Machine(void);
+void RelayState_Machine(void);
+void clearTdata(void);
+
+volatile unsigned char SM1_Clk;          //define variable that will clock the state machines
+
+unsigned char request[8] = {0x01, 0x04, 0x00, 0x00, 0x00, 0x0A, 0x70, 0x0D}; //define modbus request frame that is sent to pzem module
+volatile unsigned char rx_data[25];      //define array that will store pzem response frame
+volatile unsigned char rx_done = 0;      //define flag that will tell when pzem data is received
+volatile unsigned char relay_rx = 0;     //define variable that stores 1 byte command from esp32
+volatile unsigned char relay_rx_done = 0;//define flag that will tell when command from esp32 is received
+volatile unsigned char relay_rx_buffer = 0; //define variable that stores last command from esp32
+
+unsigned long voltage;                   //define variable that stores encoded voltage value with pzem id
+unsigned long current;                   //define variable that stores encoded current value with pzem id
+unsigned long watts;                     //define variable that stores encoded power value with pzem id
+unsigned long watthours;                 //define variable that stores encoded energy value with pzem id
+
+unsigned char pzem = 1;                  //define variable that tracks which pzem is being polled (1-3)
+unsigned char pzem_active = 1;           //define variable that tracks which pzem sent the last valid frame
+unsigned char timeout;                   //define variable that counts how long we wait for pzem response
+
+//define uart state machine states
+enum {UInit, UWait, UTransmit, URecieve, UTransmitESP} UARTState;
+
+//define compute state machine states
+enum {CInit, CWait, CCompute} CalcState;
+
+//define relay state machine states
+enum {RInit, RUpdate} RState;
+
+unsigned char Tdata[17];                 //define array that stores formatted data frame sent to esp32
+
+//timer interrupt that clocks state machines
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM1)          //if timer 1 period elapsed
+    {
+        SM1_Clk = 1;                     //set state machine clock flag
+    }
+}
+
+//uart receive complete interrupt for all uarts
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    //if response is from any of the 3 pzem uarts
+    if (huart->Instance == USART1 || huart->Instance == UART5 || huart->Instance == USART3)
+    {
+        rx_done = 1;                     //set flag that pzem data frame is complete
+    }
+    //if response is from esp32 uart
+    else if (huart->Instance == USART6)
+    {
+        relay_rx_done = 1;               //set flag that relay command byte is complete
+    }
+}
+
+int main(void)
+{
+    HAL_Init();                          //initialize hal library and reset peripherals
+    SystemClock_Config();                //configure system clock
+    MX_GPIO_Init();                      //initialize gpio ports
+    MX_UART5_Init();                     //initialize uart5 for pzem 2
+    MX_USART1_UART_Init();               //initialize usart1 for pzem 1
+    MX_USART3_UART_Init();               //initialize usart3 for pzem 3
+    MX_USART6_UART_Init();               //initialize usart6 for esp32
+    MX_TIM1_Init();                      //initialize timer 1
+
+    HAL_TIM_Base_Start_IT(&htim1);       //start timer 1 with interrupt enabled
+
+    UARTState = UInit;                   //set uart state machine to init
+    CalcState = CInit;                   //set compute state machine to init
+    RState = RInit;                      //set relay state machine to init
+
+    unsigned char Init = 0;              //define variable that counts timer ticks before polling pzem
+
+    while(1)
+    {
+        if(SM1_Clk){                     //if timer 1 clock flag set
+            SM1_Clk = 0;                 //clear clock flag
+            CState_Machine();            //run compute state machine
+            Init = Init + 1;             //increment init counter
+        }
+        if (Init >= 4)                   //after 4 timer ticks run slower state machines
+        {
+            UState_Machine();            //run uart state machine
+            RelayState_Machine();        //run relay state machine
+            Init = 0;                    //reset init counter
+        }
+    }
+}
+
+//uart state machine that polls pzem and sends data to esp32
+void UState_Machine(void)
+{
+    switch (UARTState)
+    {
+        case UInit:                      //initialize uart state
+            timeout = 0;                 //clear timeout counter
+            rx_done = 0;                 //clear receive flag
+            UARTState = UWait;           //go to wait state
+        break;
+
+        case UWait:                      //idle state between polls
+            UARTState = UTransmit;       //go to transmit state
+        break;
+
+        case UTransmit:                  //state that sends modbus request to current pzem
+            if (pzem == 1)               //if talking to pzem 1
+            {
+                if (HAL_UART_Transmit(&huart1, request, 8, 50) == HAL_OK) //send request frame
+                {
+                    pzem_active = 1;     //set active pzem to 1
+                    HAL_UART_Receive_IT(&huart1, (unsigned char*)rx_data, 25); //start receive interrupt for 25 byte frame
+                    UARTState = URecieve;//go to receive state
+                }
+                else
+                {
+                    UARTState = UWait;   //if transmit fails try again later
+                }
+            }
+            else if (pzem == 2)          //if talking to pzem 2
+            {
+                if (HAL_UART_Transmit(&huart5, request, 8, 50) == HAL_OK) //send request frame
+                {
+                    pzem_active = 2;     //set active pzem to 2
+                    HAL_UART_Receive_IT(&huart5, (unsigned char*)rx_data, 25); //start receive interrupt
+                    UARTState = URecieve;//go to receive state
+                }
+                else
+                {
+                    UARTState = UWait;   //if transmit fails try again later
+                }
+            }
+            else if (pzem == 3)          //if talking to pzem 3
+            {
+                if (HAL_UART_Transmit(&huart3, request, 8, 50) == HAL_OK) //send request frame
+                {
+                    pzem_active = 3;     //set active pzem to 3
+                    HAL_UART_Receive_IT(&huart3, (unsigned char*)rx_data, 25); //start receive interrupt
+                    UARTState = URecieve;//go to receive state
+                }
+                else
+                {
+                    UARTState = UWait;   //if transmit fails try again later
+                }
+            }
+        break;
+
+        case URecieve:                   //state that waits for pzem response frame
+            if (rx_done)                 //if frame received
+            {
+                rx_done = 0;             //clear receive flag
+                UARTState = UTransmitESP;//go to transmit to esp state
+            }
+            else                         //if frame not yet received
+            {
+                timeout = timeout + 1;   //increment timeout counter
+                if (timeout >= 2)        //if timeout reached
+                {
+                    timeout = 0;         //reset timeout
+                    UARTState = UTransmitESP; //still send last valid values to esp32
+                }
+            }
+        break;
+
+        case UTransmitESP:               //state that formats and sends data frame to esp32
+            clearTdata();                //clear transmit buffer
+
+            Tdata[0] = 0xAA;             //set start byte for esp32 frame
+
+            //place 4 bytes of voltage into buffer
+            Tdata[1] = (unsigned char)(voltage >> 24);
+            Tdata[2] = (unsigned char)(voltage >> 16);
+            Tdata[3] = (unsigned char)(voltage >> 8);
+            Tdata[4] = (unsigned char)(voltage);
+
+            //place 4 bytes of current into buffer
+            Tdata[5] = (unsigned char)(current >> 24);
+            Tdata[6] = (unsigned char)(current >> 16);
+            Tdata[7] = (unsigned char)(current >> 8);
+            Tdata[8] = (unsigned char)(current);
+
+            //place 4 bytes of watts into buffer
+            Tdata[9]  = (unsigned char)(watts >> 24);
+            Tdata[10] = (unsigned char)(watts >> 16);
+            Tdata[11] = (unsigned char)(watts >> 8);
+            Tdata[12] = (unsigned char)(watts);
+
+            //place 4 bytes of watthours into buffer
+            Tdata[13] = (unsigned char)(watthours >> 24);
+            Tdata[14] = (unsigned char)(watthours >> 16);
+            Tdata[15] = (unsigned char)(watthours >> 8);
+            Tdata[16] = (unsigned char)(watthours);
+
+            if (HAL_UART_Transmit(&huart6, Tdata, 17, 50) == HAL_OK) //send frame to esp32
+            {
+                UARTState = UWait;       //if successful go back to wait
+            }
+            else
+            {
+                UARTState = UTransmitESP;//if fail try to resend
+            }
+        break;
+    }
+}
+
+//compute state machine that parses pzem data and tags it with which pzem it came from
+void CState_Machine(void)
+{
+    unsigned long raw_voltage;           //define temporary raw voltage value
+    unsigned long raw_current;           //define temporary raw current value
+    unsigned long raw_watts;             //define temporary raw watts value
+    unsigned long raw_watthours;         //define temporary raw watthours value
+
+    switch (CalcState){
+        case CInit:                      //initialize compute state
+
+        CalcState = CWait;               //go to wait state
+        break;
+
+        case CWait:                      //wait until pzem frame is received
+            if (rx_done)                 //if pzem data ready
+            {
+                CalcState = CCompute;    //go to compute state
+            }
+        break;
+
+        case CCompute:                   //state that decodes pzem response frame
+            //check that frame header matches expected pzem response (device id, function code, byte count)
+            if (rx_data[0] == 0x01 && rx_data[1] == 0x04 && rx_data[2] == 0x14)
+            {
+                //extract raw voltage (first register)
+                raw_voltage = ((rx_data[3] << 8) | rx_data[4]);
+
+                //extract raw current (2 registers, high word then low word)
+                raw_current = ((rx_data[7] << 8 | rx_data[8]) << 16) | ((rx_data[5] << 8) | rx_data[6]);
+
+                //extract raw power (2 registers)
+                raw_watts = ((rx_data[11] << 8 | rx_data[12]) << 16) | ((rx_data[9] << 8) | rx_data[10]);
+
+                //extract raw energy (2 registers)
+                raw_watthours = ((rx_data[15] << 8 | rx_data[16]) << 16) | ((rx_data[13] << 8) | rx_data[14]);
+
+                //tag values with which pzem they came from by setting top bits
+                if (pzem_active == 1)    //if data came from pzem 1
+                {
+                    voltage   = raw_voltage   | 0x00000000; //no tag bits set for pzem 1
+                    current   = raw_current   | 0x00000000;
+                    watts     = raw_watts     | 0x00000000;
+                    watthours = raw_watthours | 0x00000000;
+                }
+                else if (pzem_active == 2) //if data came from pzem 2
+                {
+                    voltage   = raw_voltage   | 0x40000000; //set tag bit 30 for pzem 2
+                    current   = raw_current   | 0x40000000;
+                    watts     = raw_watts     | 0x40000000;
+                    watthours = raw_watthours | 0x40000000;
+                }
+                else if (pzem_active == 3) //if data came from pzem 3
+                {
+                    voltage   = raw_voltage   | 0x80000000; //set tag bit 31 for pzem 3
+                    current   = raw_current   | 0x80000000;
+                    watts     = raw_watts     | 0x80000000;
+                    watthours = raw_watthours | 0x80000000;
+                }
+
+                pzem = pzem + 1;         //move to next pzem to poll
+                if (pzem > 3)            //if pzem exceeds 3
+                {
+                    pzem = 1;            //wrap back to pzem 1
+                }
+            }
+            CalcState = CWait;           //go back to wait state
+        break;
+    }
+}
+
+//relay state machine that updates relay output based on command from esp32
+void RelayState_Machine(void)
+{
+    switch (RState)
+    {
+        case RInit:                                         //initialize relay state
+            relay_rx_done = 0;                              //clear relay receive flag
+            HAL_UART_Receive_IT(&huart6, (unsigned char *)&relay_rx, 1); //start irq receive of 1 byte from esp32
+            RState = RUpdate;                               //go to update state
+        break;
+
+        case RUpdate:                                       //state that updates relay output
+            if (relay_rx_done)                              //if command byte received
+            {
+                relay_rx_done = 0;                          //clear flag
+                relay_rx_buffer = relay_rx;                 //store last command
+
+                //decode 2 bit relay command and set gpio outputs
+                if (relay_rx_buffer == 0x11)                //both relays on
+                {
+                    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
+                    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_11, GPIO_PIN_SET);
+                }
+                else if (relay_rx_buffer == 0x10)           //relay 1 on, relay 2 off
+                {
+                    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
+                    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_11, GPIO_PIN_RESET);
+                }
+                else if (relay_rx_buffer == 0x01)           //relay 1 off, relay 2 on
+                {
+                    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
+                    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_11, GPIO_PIN_SET);
+                }
+                else                                        //any other command turns both off
+                {
+                    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
+                    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_11, GPIO_PIN_RESET);
+                }
+
+                HAL_UART_Receive_IT(&huart6, (unsigned char *)&relay_rx, 1); //restart receive for next command
+            }
+        break;
+    }
+}
+
+//function that clears transmit buffer that is sent to esp32
+void clearTdata(void)
+{
+    unsigned char i;                   //defines number used to count through buffer
+    for (i = 0; i < 17; i++)          //loop through all 17 bytes
+    {
+        Tdata[i] = 0;                  //set each byte to 0
+    }
+}
+
+
+
+//defult Configuration for uart, ports, and timers
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  //System clock from HSI using PLL
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 16;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+//timer1 configured to trigger every 50ms
+static void MX_TIM1_Init(void)
+{
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 8399;                     //timer clock = 84MHz / (8399+1) = 10khz
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 499;                         //triggers every 50ms
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+//USART1 for PZEM 1 (9600 8N1)
+static void MX_USART1_UART_Init(void)
+{
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 9600;                     //PZEM 1 baud
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+//UART5 for PZEM 2 (9600 8N1)
+static void MX_UART5_Init(void)
+{
+  huart5.Instance = UART5;
+  huart5.Init.BaudRate = 9600;                     //PZEM 2 baud
+  huart5.Init.WordLength = UART_WORDLENGTH_8B;
+  huart5.Init.StopBits = UART_STOPBITS_1;
+  huart5.Init.Parity = UART_PARITY_NONE;
+  huart5.Init.Mode = UART_MODE_TX_RX;
+  huart5.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart5.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+//USART3 for PZEM 3 (9600 8N1)
+static void MX_USART3_UART_Init(void)
+{
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 9600;                     //PZEM 3 baud
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+//USART6 for ESP32 link (115200 8N1)
+static void MX_USART6_UART_Init(void)
+{
+  huart6.Instance        = USART6;
+  huart6.Init.BaudRate   = 115200;
+  huart6.Init.WordLength = UART_WORDLENGTH_8B;
+  huart6.Init.StopBits   = UART_STOPBITS_1;
+  huart6.Init.Parity     = UART_PARITY_NONE;
+  huart6.Init.Mode       = UART_MODE_TX_RX;
+  huart6.Init.HwFlowCtl  = UART_HWCONTROL_NONE;
+  huart6.Init.OverSampling = UART_OVERSAMPLING_16;
+
+  if (HAL_UART_Init(&huart6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+//gpio setup for on-board led, button, uart and relay pins
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10|GPIO_PIN_11, GPIO_PIN_SET);
+
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = USART_TX_Pin|USART_RX_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF7_USART2;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = LD2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_11;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+}
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif
