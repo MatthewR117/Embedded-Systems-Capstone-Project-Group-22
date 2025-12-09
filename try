@@ -2,94 +2,100 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 
-const char *WIFI_SSID     = "OnePlus 13";  //define wifi ssid
-const char *WIFI_PASSWORD = "12345678";    //define wifi password
+const char *WIFI_SSID     = "OnePlus 13";  // Define WiFi SSID
+const char *WIFI_PASSWORD = "12345678";    // Define WiFi Password
 
-const char *FIREBASE_HOST = "https://drjohnson0x01-default-rtdb.firebaseio.com"; //define firebase base url
-const char *FIREBASE_AUTH_SUFFIX = "";                                           //define firebase auth suffix if needed
+const char *FIREBASE_HOST = "https://drjohnson0x01-default-rtdb.firebaseio.com"; // Define Firebase base URL
+const char *FIREBASE_AUTH_SUFFIX = "";                                           // Define Firebase auth suffix if needed
 
-WiFiClientSecure g_client;                 //define secure wifi client used by http
+WiFiClientSecure g_client;                 // Define secure Wi-Fi client used by HTTP
 
-const int UART2_RX_PIN = 16;               //define pin used as esp32 rx2 (connect to stm32 tx6)
-const int UART2_TX_PIN = 17;               //define pin used as esp32 tx2 (connect to stm32 rx6)
+const int UART2_RX_PIN = 16;               // Define pin used as ESP32 RX2 (connect to STM32 TX6)
+const int UART2_TX_PIN = 17;               // Define pin used as ESP32 TX2 (connect to STM32 RX6)
 
-//define variables that control how often relay commands are read from firebase
-unsigned long g_lastRelayPollMs = 0;       //stores last time relay command was polled
-const unsigned long g_relayPollIntervalMs = 300; //relay polling interval in ms
-unsigned char g_relayCmdByte = 0;          //stores last relay command byte sent to stm32
+// Define variables that control how often relay commands are read from Firebase
+unsigned long g_lastRelayPollMs = 0;       // Stores last time relay command was polled
+const unsigned long g_relayPollIntervalMs = 1000; // Relay polling interval in ms (increased to 1 second)
+unsigned char g_relayCmdByte = 0;          // Stores last relay command byte sent to STM32
 
-//define buffer that stores 16 telemetry bytes from stm32 (header excluded)
-unsigned char g_telemBuf[16];              //4 x 32 bit values (voltage, current, watts, watthours)
+// Define buffer that stores 16 telemetry bytes from STM32 (header excluded)
+unsigned char g_telemBuf[16];              // 4 x 32 bit values (voltage, current, watts, watthours)
 
-//define framing variables that track header and data bytes from stm32
-static bool   g_inFrame    = false;        //flag that says we are currently inside a stm32 frame
-static int    g_frameIndex = 0;            //index into g_telemBuf during frame reception
+// Define framing variables that track header and data bytes from STM32
+static bool   g_inFrame    = false;        // Flag that says we are currently inside a STM32 frame
+static int    g_frameIndex = 0;            // Index into g_telemBuf during frame reception
 
-//define timeout variables for dropping partial frames
-static unsigned long g_lastTelemByteMs = 0; //stores time when last telemetry byte arrived
-const unsigned long  g_telemTimeoutMs  = 200; //timeout in ms before dropping partial frame
+// Define timeout variables for dropping partial frames
+static unsigned long g_lastTelemByteMs = 0; // Stores time when last telemetry byte arrived
+const unsigned long  g_telemTimeoutMs  = 1000; // Timeout in ms before dropping partial frame (increased to 1 second)
 
-//function prototypes for wifi, firebase, relay handling, and telemetry handling
-void connectWiFi(void);                    //function that connects to wifi
-bool fbGetInt(const char *path, long *valueOut); //function that reads integer value from firebase
+void connectWiFi(void);                    // Function that connects to WiFi
+bool fbGetInt(const char *path, long *valueOut); // Function that reads integer value from Firebase
 bool fbPatchTelemetry(unsigned long vWord,
                       unsigned long cWord,
                       unsigned long wWord,
-                      unsigned long whWord);     //function that uploads telemetry words to firebase
-void handleRelay(void);                   //function that reads relay command from firebase and sends to stm32
-void handleTelemetry(void);               //function that receives telemetry from stm32 and uploads to firebase
+                      unsigned long whWord);     // Function that uploads telemetry words to Firebase
+void handleRelay(void);                   // Function that reads relay command from Firebase and sends to STM32
+void handleTelemetry(void);               // Function that receives telemetry from STM32 and uploads to Firebase
 
 void setup() {
-  Serial.begin(115200);                   //start serial monitor
+  Serial.begin(115200);                   // Start serial monitor
 
-  Serial2.begin(115200, SERIAL_8N1, UART2_RX_PIN, UART2_TX_PIN); //start uart2 link to stm32
+  Serial2.begin(115200, SERIAL_8N1, UART2_RX_PIN, UART2_TX_PIN); // Start UART2 link to STM32
 
-  connectWiFi();                          //connect esp32 to wifi network
-  g_client.setInsecure();                 //allow https without certificate
+  connectWiFi();                          // Connect ESP32 to WiFi network
+  g_client.setInsecure();                 // Allow HTTPS without certificate
 }
 
 void loop() {
-  handleRelay();                          //periodically check relay command in firebase
-  handleTelemetry();                      //read telemetry frames from stm32 and send to firebase
+  handleRelay();                          // Periodically check relay command in Firebase
+  handleTelemetry();                      // Read telemetry frames from STM32 and send to Firebase
 }
 
 /*************** WiFi ***************/
 void connectWiFi(void) {
-  WiFi.mode(WIFI_STA);                    //set wifi to station mode
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);   //start wifi connection
+  WiFi.mode(WIFI_STA);                    // Set Wi-Fi to station mode
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);   // Start Wi-Fi connection
 
-  while (WiFi.status() != WL_CONNECTED) { //wait until wifi connects
+  while (WiFi.status() != WL_CONNECTED) { // Wait until Wi-Fi connects
     delay(500);
   }
 }
 
 /*************** Firebase helpers ***************/
 bool fbGetInt(const char *path, long *valueOut) {
-  if (WiFi.status() != WL_CONNECTED) {    //if wifi is disconnected reconnect
+  if (WiFi.status() != WL_CONNECTED) {    // If Wi-Fi is disconnected reconnect
     connectWiFi();
   }
 
-  HTTPClient http;                        //create http client
-  String url = String(FIREBASE_HOST) + String(path) + String(FIREBASE_AUTH_SUFFIX); //build full url
+  HTTPClient http;                        // Create HTTP client
+  String url = String(FIREBASE_HOST) + String(path) + String(FIREBASE_AUTH_SUFFIX); // Build full URL
 
-  http.begin(g_client, url);              //start https request
-  int code = http.GET();                  //send get request
+  http.begin(g_client, url);              // Start HTTPS request
+  int code = http.GET();                  // Send GET request
 
-  if (code != HTTP_CODE_OK) {             //if request fails or not 200
+  unsigned long startTime = millis();     // Start timing
+
+  while (code != HTTP_CODE_OK && millis() - startTime < 5000) {  // Retry for 5 seconds
+    delay(500);
+    code = http.GET();                   // Retry the request
+  }
+
+  if (code != HTTP_CODE_OK) {             // If request still fails, return false
     http.end();
     return false;
   }
 
-  String body = http.getString();         //read reply body
+  String body = http.getString();         // Read the response body
   http.end();
 
-  body.trim();                            //remove whitespace
-  if (body.length() == 0 || body == "null") { //if no value stored yet
+  body.trim();                            // Remove whitespace
+  if (body.length() == 0 || body == "null") { // If no value stored yet
     return false;
   }
 
-  long v = body.toInt();                  //convert string to integer
-  *valueOut = v;                          //store value in output pointer
+  long v = body.toInt();                  // Convert string to integer
+  *valueOut = v;                          // Store value in output pointer
   return true;
 }
 
@@ -97,51 +103,51 @@ bool fbPatchTelemetry(unsigned long vWord,
                       unsigned long cWord,
                       unsigned long wWord,
                       unsigned long whWord) {
-  if (WiFi.status() != WL_CONNECTED) {    //if wifi dropped reconnect
+  if (WiFi.status() != WL_CONNECTED) {    // If Wi-Fi dropped reconnect
     connectWiFi();
   }
 
-  HTTPClient http;                        //create http client
-  String path = "/iot_data.json";         //path that stores telemetry in firebase
-  String url  = String(FIREBASE_HOST) + path + String(FIREBASE_AUTH_SUFFIX); //build full url
+  HTTPClient http;                        // Create HTTP client
+  String path = "/iot_data.json";         // Path that stores telemetry in Firebase
+  String url  = String(FIREBASE_HOST) + path + String(FIREBASE_AUTH_SUFFIX); // Build full URL
 
-  http.begin(g_client, url);              //start https request
-  http.addHeader("Content-Type", "application/json"); //set content type for json
+  http.begin(g_client, url);              // Start HTTPS request
+  http.addHeader("Content-Type", "application/json"); // Set content type for JSON
 
-  //build json payload using 32 bit words from stm32
+  // Build JSON payload using 32-bit words from STM32
   String payload = String("{\"voltage\":")   + String(vWord)  +
                    String(",\"current\":")   + String(cWord)  +
                    String(",\"watts\":")     + String(wWord)  +
                    String(",\"watthours\":") + String(whWord) +
                    String("}");
 
-  int code = http.sendRequest("PATCH", payload); //send patch request to update telemetry fields
+  int code = http.sendRequest("PATCH", payload); // Send PATCH request to update telemetry fields
 
-  if (code <= 0) {                         //if request failed
+  if (code <= 0) {                         // If request failed
     http.end();
     return false;
   }
 
-  String resp = http.getString();          //optional: read response (not used)
+  String resp = http.getString();          // Optional: Read response (not used)
   http.end();
 
-  return (code >= 200 && code < 300);      //return true on http 2xx
+  return (code >= 200 && code < 300);      // Return true on HTTP 2xx
 }
 
 /*************** Relay handling ***************/
 void handleRelay(void) {
-  unsigned long now = millis();           //get current time in ms
-  if (now - g_lastRelayPollMs < g_relayPollIntervalMs) { //if not yet time to poll relay value
+  unsigned long now = millis();           // Get current time in ms
+  if (now - g_lastRelayPollMs < g_relayPollIntervalMs) { // If not yet time to poll relay value
     return;
   }
-  g_lastRelayPollMs = now;                //update last poll time
+  g_lastRelayPollMs = now;                // Update last poll time
 
-  long relaysValue = 0;                   //stores integer read from firebase
-  if (!fbGetInt("/iot_data/relays.json", &relaysValue)) { //read /iot_data/relays from firebase
-    return;                               //if read fails skip this cycle
+  long relaysValue = 0;                   // Stores integer read from Firebase
+  if (!fbGetInt("/iot_data/relays.json", &relaysValue)) { // Read /iot_data/relays from Firebase
+    return;                               // If read fails, skip this cycle
   }
 
-  g_relayCmdByte = (unsigned char)(relaysValue & 0xFF); //use lower 8 bits as command byte to stm32
+  g_relayCmdByte = (unsigned char)(relaysValue & 0xFF); // Use lower 8 bits as command byte to STM32
 
   Serial.print("[RELAY] Firebase relays int = ");
   Serial.println(relaysValue);
@@ -149,40 +155,40 @@ void handleRelay(void) {
   if (g_relayCmdByte < 0x10) Serial.print("0");
   Serial.println(g_relayCmdByte, HEX);
 
-  Serial2.write(g_relayCmdByte);          //send relay command byte to stm32 over uart2
+  Serial2.write(g_relayCmdByte);          // Send relay command byte to STM32 over UART2
 }
 
 /*************** Telemetry handling with header strip ***************/
-//stm32 sends: 0xAA header + 16 data bytes (4 x 32 bit words)
-//esp32 waits for 0xAA, buffers 16 bytes, converts to 4 unsigned long values, then uploads to firebase
+// STM32 sends: 0xAA header + 16 data bytes (4 x 32-bit words)
+// ESP32 waits for 0xAA, buffers 16 bytes, converts to 4 unsigned long values, then uploads to Firebase
 void handleTelemetry(void) {
-  unsigned long now = millis();           //get current time in ms
+  unsigned long now = millis();           // Get current time in ms
 
-  //if inside a frame and no bytes have arrived within timeout drop partial frame
+  // If inside a frame and no bytes have arrived within timeout, drop partial frame
   if (g_inFrame && (now - g_lastTelemByteMs > g_telemTimeoutMs)) {
-    g_inFrame    = false;                 //reset frame flag
-    g_frameIndex = 0;                     //reset index
+    g_inFrame    = false;                 // Reset frame flag
+    g_frameIndex = 0;                     // Reset index
   }
 
-  while (Serial2.available() > 0) {       //while there is data from stm32
-    int b = Serial2.read();               //read next byte
+  while (Serial2.available() > 0) {       // While there is data from STM32
+    int b = Serial2.read();               // Read next byte
     if (b < 0) {
       break;
     }
-    uint8_t ub = (uint8_t)b;              //cast to unsigned byte
-    g_lastTelemByteMs = now;              //update time of last telemetry byte
+    uint8_t ub = (uint8_t)b;              // Cast to unsigned byte
+    g_lastTelemByteMs = now;              // Update time of last telemetry byte
 
-    if (!g_inFrame) {                     //if not currently in a frame
-      if (ub == 0xAA) {                   //wait for header 0xAA
-        g_inFrame    = true;              //start new frame
-        g_frameIndex = 0;                 //reset index for data bytes
+    if (!g_inFrame) {                     // If not currently in a frame
+      if (ub == 0xAA) {                   // Wait for header 0xAA
+        g_inFrame    = true;              // Start new frame
+        g_frameIndex = 0;                 // Reset index for data bytes
       }
-      //ignore any bytes that are not header
+      // Ignore any bytes that are not header
     } else {
-      //inside frame: store up to 16 data bytes
+      // Inside frame: store up to 16 data bytes
       g_telemBuf[g_frameIndex++] = ub;
 
-      if (g_frameIndex >= 16) {           //once 16 bytes received we have full payload
+      if (g_frameIndex >= 16) {           // Once 16 bytes received, we have full payload
         unsigned long vWord = ((unsigned long)g_telemBuf[0] << 24) |
                               ((unsigned long)g_telemBuf[1] << 16) |
                               ((unsigned long)g_telemBuf[2] << 8)  |
@@ -203,9 +209,9 @@ void handleTelemetry(void) {
                                ((unsigned long)g_telemBuf[14] << 8)  |
                                ((unsigned long)g_telemBuf[15]);
 
-        fbPatchTelemetry(vWord, cWord, wWord, whWord); //upload 4 words to firebase
+        fbPatchTelemetry(vWord, cWord, wWord, whWord); // Upload 4 words to Firebase
 
-        g_inFrame    = false;             //reset frame state for next packet
+        g_inFrame    = false;             // Reset frame state for next packet
         g_frameIndex = 0;
       }
     }
