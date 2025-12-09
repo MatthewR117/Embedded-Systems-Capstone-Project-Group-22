@@ -1,0 +1,220 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+
+const char *WIFI_SSID     = "OnePlus 13";
+const char *WIFI_PASSWORD = "12345678";
+
+const char *FIREBASE_HOST = "https://drjohnson0x01-default-rtdb.firebaseio.com";
+const char *FIREBASE_AUTH_SUFFIX = "";
+
+WiFiClientSecure g_client;
+
+const int UART2_RX_PIN = 16;  // ESP32 RX2 (connect to STM32 TX6)
+const int UART2_TX_PIN = 17;  // ESP32 TX2 (connect to STM32 RX6);
+
+// Relay polling
+unsigned long g_lastRelayPollMs = 0;
+const unsigned long g_relayPollIntervalMs = 300;
+unsigned char g_relayCmdByte = 0;
+
+// Relay Firebase failure handling
+short g_fbFailCount = 0;
+const short g_fbFailThreshold = 10;
+
+// Telemetry receive buffer (16 bytes from STM32, header stripped)
+unsigned char g_telemBuf[16];
+
+// Simple framing state for header + payload
+static bool   g_inFrame    = false;
+static int    g_frameIndex = 0;
+
+// Optional: timeout to drop half-frames if link stalls
+static unsigned long g_lastTelemByteMs = 0;
+const unsigned long  g_telemTimeoutMs  = 200;  // ms
+
+void connectWiFi(void);
+bool fbGetInt(const char *path, long *valueOut);
+bool fbPatchTelemetry(unsigned long vWord,
+                      unsigned long cWord,
+                      unsigned long wWord,
+                      unsigned long whWord);
+void handleRelay(void);
+void handleTelemetry(void);
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(115200, SERIAL_8N1, UART2_RX_PIN, UART2_TX_PIN);
+
+  connectWiFi();
+  g_client.setInsecure();
+}
+
+void loop() {
+  handleRelay();
+  handleTelemetry();
+}
+
+/*************** WiFi ***************/
+void connectWiFi(void) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+}
+
+/*************** Firebase helpers ***************/
+bool fbGetInt(const char *path, long *valueOut) {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  HTTPClient http;
+  String url = String(FIREBASE_HOST) + String(path) + String(FIREBASE_AUTH_SUFFIX);
+
+  http.begin(g_client, url);
+  int code = http.GET();
+
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  body.trim();
+  if (body.length() == 0 || body == "null") {
+    return false;
+  }
+
+  long v = body.toInt();
+  *valueOut = v;
+  return true;
+}
+
+bool fbPatchTelemetry(unsigned long vWord,
+                      unsigned long cWord,
+                      unsigned long wWord,
+                      unsigned long whWord) {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  HTTPClient http;
+  String path = "/iot_data.json";
+  String url  = String(FIREBASE_HOST) + path + String(FIREBASE_AUTH_SUFFIX);
+
+  http.begin(g_client, url);
+  http.addHeader("Content-Type", "application/json");
+
+  String payload = String("{\"voltage\":")   + String(vWord)  +
+                   String(",\"current\":")  + String(cWord)  +
+                   String(",\"watts\":")    + String(wWord)  +
+                   String(",\"watthours\":")+ String(whWord) +
+                   String("}");
+
+  int code = http.sendRequest("PATCH", payload);
+
+  if (code <= 0) {
+    http.end();
+    return false;
+  }
+
+  String resp = http.getString();
+  http.end();
+
+  return (code >= 200 && code < 300);
+}
+
+/*************** Relay handling with auto-recover ***************/
+void handleRelay(void) {
+  unsigned long now = millis();
+  if (now - g_lastRelayPollMs < g_relayPollIntervalMs) {
+    return;
+  }
+  g_lastRelayPollMs = now;
+
+  long relaysValue = 0;
+  if (!fbGetInt("/iot_data/relays.json", &relaysValue)) {
+    g_fbFailCount++;
+
+    if (g_fbFailCount >= g_fbFailThreshold) {
+      Serial.println("[RELAY] fbGetInt failed repeatedly, resetting WiFi");
+      WiFi.disconnect(true);
+      delay(100);
+      connectWiFi();
+      g_fbFailCount = 0;
+    }
+    return;
+  }
+
+  g_fbFailCount = 0;
+
+  g_relayCmdByte = (unsigned char)(relaysValue & 0xFF);
+
+  Serial.print("[RELAY] Firebase relays int = ");
+  Serial.println(relaysValue);
+  Serial.print("[RELAY] UART cmd byte = 0x");
+  if (g_relayCmdByte < 0x10) Serial.print("0");
+  Serial.println(g_relayCmdByte, HEX);
+
+  Serial2.write(g_relayCmdByte);
+}
+
+/*************** Telemetry handling (header 0xAA + 16 bytes) ***************/
+void handleTelemetry(void) {
+  unsigned long now = millis();
+
+  if (g_inFrame && (now - g_lastTelemByteMs > g_telemTimeoutMs)) {
+    g_inFrame    = false;
+    g_frameIndex = 0;
+  }
+
+  while (Serial2.available() > 0) {
+    int b = Serial2.read();
+    if (b < 0) {
+      break;
+    }
+    unsigned char ub = (unsigned char)b;
+    g_lastTelemByteMs = now;
+
+    if (!g_inFrame) {
+      if (ub == 0xAA) {
+        g_inFrame    = true;
+        g_frameIndex = 0;
+      }
+    } else {
+      g_telemBuf[g_frameIndex++] = ub;
+
+      if (g_frameIndex >= 16) {
+        unsigned long vWord = ((unsigned long)g_telemBuf[0] << 24) |
+                              ((unsigned long)g_telemBuf[1] << 16) |
+                              ((unsigned long)g_telemBuf[2] << 8)  |
+                              ((unsigned long)g_telemBuf[3]);
+
+        unsigned long cWord = ((unsigned long)g_telemBuf[4] << 24) |
+                              ((unsigned long)g_telemBuf[5] << 16) |
+                              ((unsigned long)g_telemBuf[6] << 8)  |
+                              ((unsigned long)g_telemBuf[7]);
+
+        unsigned long wWord = ((unsigned long)g_telemBuf[8] << 24) |
+                              ((unsigned long)g_telemBuf[9] << 16) |
+                              ((unsigned long)g_telemBuf[10] << 8) |
+                              ((unsigned long)g_telemBuf[11]);
+
+        unsigned long whWord = ((unsigned long)g_telemBuf[12] << 24) |
+                               ((unsigned long)g_telemBuf[13] << 16) |
+                               ((unsigned long)g_telemBuf[14] << 8)  |
+                               ((unsigned long)g_telemBuf[15]);
+
+        fbPatchTelemetry(vWord, cWord, wWord, whWord);
+
+        g_inFrame    = false;
+        g_frameIndex = 0;
+      }
+    }
+  }
+}
