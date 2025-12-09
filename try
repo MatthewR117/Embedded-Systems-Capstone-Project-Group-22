@@ -12,6 +12,10 @@ const int UART2_TX_PIN = 17; // Define pin used as ESP32 TX2 (connect to STM32 R
 unsigned long g_lastRelayPollMs = 0; // Stores last time relay command was polled
 const unsigned long g_relayPollIntervalMs = 300; // Relay polling interval in ms (300ms as requested)
 unsigned char g_relayCmdByte = 0; // Stores last relay command byte sent to STM32
+// WiFi reconnect (non-blocking)
+unsigned long g_lastWiFiAttemptMs = 0;
+const unsigned long g_wifiReconnectIntervalMs = 5000;  // Try every 5s if disconnected
+const unsigned long g_wifiConnectTimeoutMs = 10000;    // Max 10s per attempt
 // Define buffer that stores 16 telemetry bytes from STM32 (header excluded)
 unsigned char g_telemBuf[16]; // 4 x 32 bit values (voltage, current, watts, watthours)
 // Define framing variables that track header and data bytes from STM32
@@ -20,7 +24,7 @@ static int g_frameIndex = 0; // Index into g_telemBuf during frame reception
 // Define timeout variables for dropping partial frames
 static unsigned long g_lastTelemByteMs = 0; // Stores time when last telemetry byte arrived
 const unsigned long g_telemTimeoutMs = 1000; // Timeout in ms before dropping partial frame (increased to 1 second)
-void connectWiFi(void); // Function that connects to Wi-Fi
+void connectWiFi(void); // Function that connects to Wi-Fi (now non-blocking helper)
 bool fbGetInt(const char *path, long *valueOut); // Function that reads integer value from Firebase
 bool fbPatchTelemetry(unsigned long vWord,
                       unsigned long cWord,
@@ -28,32 +32,63 @@ bool fbPatchTelemetry(unsigned long vWord,
                       unsigned long whWord); // Function that uploads telemetry words to Firebase
 void handleRelay(void); // Function that reads relay command from Firebase and sends to STM32
 void handleTelemetry(void); // Function that receives telemetry from STM32 and uploads to Firebase
+void handleWiFi(void); // Non-blocking WiFi manager
 void setup() {
   Serial.begin(115200); // Start serial monitor
   Serial2.begin(115200, SERIAL_8N1, UART2_RX_PIN, UART2_TX_PIN); // Start UART2 link to STM32
-  connectWiFi(); // Connect ESP32 to Wi-Fi network
+  WiFi.mode(WIFI_STA); // Set WiFi mode
+  connectWiFi(); // Initial connect attempt
   g_client.setInsecure(); // Allow HTTPS without certificate
 }
 void loop() {
+  handleWiFi(); // Manage WiFi non-blockingly
   handleRelay(); // Periodically check relay command in Firebase
   handleTelemetry(); // Read telemetry frames from STM32 and send to Firebase
 }
-/*************** Wi-Fi ***************/
-void connectWiFi(void) {
-  if (WiFi.status() != WL_CONNECTED) { // Check if Wi-Fi is not connected
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // Connect to Wi-Fi
-    while (WiFi.status() != WL_CONNECTED) { // Wait for connection
-      delay(500);
-    }
+/*************** Wi-Fi (non-blocking) ***************/
+void handleWiFi(void) {
+  unsigned long now = millis();
+  if (WiFi.status() == WL_CONNECTED) {
+    g_lastWiFiAttemptMs = now;  // Reset timer if connected
+    return;
   }
+
+  if (now - g_lastWiFiAttemptMs < g_wifiReconnectIntervalMs) {
+    return;  // Not time yet
+  }
+
+  g_lastWiFiAttemptMs = now;
+  if (connectWiFi()) {
+    Serial.println("[WIFI] Reconnected successfully");
+  } else {
+    Serial.println("[WIFI] Connection attempt failed - will retry");
+  }
+}
+
+void connectWiFi(void) {
+  WiFi.disconnect(true);  // Clean slate
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long startMs = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - startMs < g_wifiConnectTimeoutMs)) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  return (WiFi.status() == WL_CONNECTED);
 }
 /*************** Firebase helpers ***************/
 bool fbGetInt(const char *path, long *valueOut) {
-  connectWiFi(); // Ensure Wi-Fi is connected before Firebase poll
+  if (WiFi.status() != WL_CONNECTED) {  // Quick check before HTTP
+    Serial.println("[FB] WiFi down - skipping GET");
+    return false;
+  }
   HTTPClient http; // Create HTTP client
   String url = String(FIREBASE_HOST) + String(path) + String(FIREBASE_AUTH_SUFFIX); // Build full URL
   http.begin(g_client, url); // Start HTTPS request
-  int code = http.GET(); // Send GET request (single attempt, no retries to avoid delays)
+  http.setTimeout(3000);  // 3s timeout for slow WiFi
+  int code = http.GET(); // Send GET request (single attempt)
   if (code != HTTP_CODE_OK) { // If request fails, return false
     http.end();
     return false;
@@ -72,11 +107,15 @@ bool fbPatchTelemetry(unsigned long vWord,
                       unsigned long cWord,
                       unsigned long wWord,
                       unsigned long whWord) {
-  connectWiFi(); // Ensure Wi-Fi is connected before Firebase poll
+  if (WiFi.status() != WL_CONNECTED) {  // Quick check
+    Serial.println("[FB] WiFi down - skipping PATCH");
+    return false;
+  }
   HTTPClient http; // Create HTTP client
   String path = "/iot_data.json"; // Path that stores telemetry in Firebase
   String url = String(FIREBASE_HOST) + path + String(FIREBASE_AUTH_SUFFIX); // Build full URL
   http.begin(g_client, url); // Start HTTPS request
+  http.setTimeout(3000);  // 3s timeout
   http.addHeader("Content-Type", "application/json"); // Set content type for JSON
   // Build JSON payload using 32-bit words from STM32
   String payload = String("{\"voltage\":") + String(vWord) +
