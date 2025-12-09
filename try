@@ -54,26 +54,17 @@ void loop() {
 
 /*************** Wi-Fi ***************/
 void connectWiFi(void) {
-  WiFi.mode(WIFI_STA);                    // Set Wi-Fi to station mode
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);   // Start Wi-Fi connection
-
-  while (WiFi.status() != WL_CONNECTED) { // Wait until Wi-Fi connects
-    delay(500);
-  }
-}
-
-void disconnectWiFi(void) {
-  WiFi.disconnect();                      // Disconnect Wi-Fi
-  delay(500);                             // Allow time for disconnection
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);   // Reconnect Wi-Fi
-  while (WiFi.status() != WL_CONNECTED) { // Wait until Wi-Fi reconnects
-    delay(500);
+  if (WiFi.status() != WL_CONNECTED) {    // Check if Wi-Fi is not connected
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // Connect to Wi-Fi
+    while (WiFi.status() != WL_CONNECTED) { // Wait for connection
+      delay(500);
+    }
   }
 }
 
 /*************** Firebase helpers ***************/
 bool fbGetInt(const char *path, long *valueOut) {
-  disconnectWiFi();    // Disconnect and reconnect to Wi-Fi for every Firebase poll
+  connectWiFi();    // Ensure Wi-Fi is connected before Firebase poll
 
   HTTPClient http;                        // Create HTTP client
   String url = String(FIREBASE_HOST) + String(path) + String(FIREBASE_AUTH_SUFFIX); // Build full URL
@@ -110,7 +101,7 @@ bool fbPatchTelemetry(unsigned long vWord,
                       unsigned long cWord,
                       unsigned long wWord,
                       unsigned long whWord) {
-  disconnectWiFi();    // Disconnect and reconnect to Wi-Fi for every Firebase poll
+  connectWiFi();    // Ensure Wi-Fi is connected before Firebase poll
 
   HTTPClient http;                        // Create HTTP client
   String path = "/iot_data.json";         // Path that stores telemetry in Firebase
