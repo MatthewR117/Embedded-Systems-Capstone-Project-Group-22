@@ -24,7 +24,7 @@ static int g_frameIndex = 0; // Index into g_telemBuf during frame reception
 // Define timeout variables for dropping partial frames
 static unsigned long g_lastTelemByteMs = 0; // Stores time when last telemetry byte arrived
 const unsigned long g_telemTimeoutMs = 1000; // Timeout in ms before dropping partial frame (increased to 1 second)
-void connectWiFi(void); // Function that connects to Wi-Fi (now non-blocking helper)
+bool connectWiFi(void); // Function that connects to Wi-Fi (now returns bool)
 bool fbGetInt(const char *path, long *valueOut); // Function that reads integer value from Firebase
 bool fbPatchTelemetry(unsigned long vWord,
                       unsigned long cWord,
@@ -65,7 +65,7 @@ void handleWiFi(void) {
   }
 }
 
-void connectWiFi(void) {
+bool connectWiFi(void) {
   WiFi.disconnect(true);  // Clean slate
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
@@ -182,27 +182,4 @@ void handleTelemetry(void) {
     } else {
       // Inside frame: store up to 16 data bytes
       g_telemBuf[g_frameIndex++] = ub;
-      if (g_frameIndex >= 16) { // Once 16 bytes received, we have full payload
-        unsigned long vWord = ((unsigned long)g_telemBuf[0] << 24) |
-                              ((unsigned long)g_telemBuf[1] << 16) |
-                              ((unsigned long)g_telemBuf[2] << 8) |
-                              ((unsigned long)g_telemBuf[3]);
-        unsigned long cWord = ((unsigned long)g_telemBuf[4] << 24) |
-                              ((unsigned long)g_telemBuf[5] << 16) |
-                              ((unsigned long)g_telemBuf[6] << 8) |
-                              ((unsigned long)g_telemBuf[7]);
-        unsigned long wWord = ((unsigned long)g_telemBuf[8] << 24) |
-                              ((unsigned long)g_telemBuf[9] << 16) |
-                              ((unsigned long)g_telemBuf[10] << 8) |
-                              ((unsigned long)g_telemBuf[11]);
-        unsigned long whWord = ((unsigned long)g_telemBuf[12] << 24) |
-                               ((unsigned long)g_telemBuf[13] << 16) |
-                               ((unsigned long)g_telemBuf[14] << 8) |
-                               ((unsigned long)g_telemBuf[15]);
-        fbPatchTelemetry(vWord, cWord, wWord, whWord); // Upload 4 words to Firebase
-        g_inFrame = false; // Reset frame state for next packet
-        g_frameIndex = 0;
-      }
-    }
-  }
-}
+      if (g_frameIndex >= 16) { // Once 16 bytes received, we have full
