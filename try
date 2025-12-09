@@ -2,8 +2,8 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 
-const char *WIFI_SSID     = "OnePlus 13";  // Define WiFi SSID
-const char *WIFI_PASSWORD = "12345678";    // Define WiFi Password
+const char *WIFI_SSID     = "OnePlus 13";  // Define Wi-Fi SSID
+const char *WIFI_PASSWORD = "12345678";    // Define Wi-Fi Password
 
 const char *FIREBASE_HOST = "https://drjohnson0x01-default-rtdb.firebaseio.com"; // Define Firebase base URL
 const char *FIREBASE_AUTH_SUFFIX = "";                                           // Define Firebase auth suffix if needed
@@ -15,7 +15,7 @@ const int UART2_TX_PIN = 17;               // Define pin used as ESP32 TX2 (conn
 
 // Define variables that control how often relay commands are read from Firebase
 unsigned long g_lastRelayPollMs = 0;       // Stores last time relay command was polled
-const unsigned long g_relayPollIntervalMs = 1000; // Relay polling interval in ms (increased to 1 second)
+const unsigned long g_relayPollIntervalMs = 300; // Relay polling interval in ms (300ms as requested)
 unsigned char g_relayCmdByte = 0;          // Stores last relay command byte sent to STM32
 
 // Define buffer that stores 16 telemetry bytes from STM32 (header excluded)
@@ -29,7 +29,7 @@ static int    g_frameIndex = 0;            // Index into g_telemBuf during frame
 static unsigned long g_lastTelemByteMs = 0; // Stores time when last telemetry byte arrived
 const unsigned long  g_telemTimeoutMs  = 1000; // Timeout in ms before dropping partial frame (increased to 1 second)
 
-void connectWiFi(void);                    // Function that connects to WiFi
+void connectWiFi(void);                    // Function that connects to Wi-Fi
 bool fbGetInt(const char *path, long *valueOut); // Function that reads integer value from Firebase
 bool fbPatchTelemetry(unsigned long vWord,
                       unsigned long cWord,
@@ -43,7 +43,7 @@ void setup() {
 
   Serial2.begin(115200, SERIAL_8N1, UART2_RX_PIN, UART2_TX_PIN); // Start UART2 link to STM32
 
-  connectWiFi();                          // Connect ESP32 to WiFi network
+  connectWiFi();                          // Connect ESP32 to Wi-Fi network
   g_client.setInsecure();                 // Allow HTTPS without certificate
 }
 
@@ -52,7 +52,7 @@ void loop() {
   handleTelemetry();                      // Read telemetry frames from STM32 and send to Firebase
 }
 
-/*************** WiFi ***************/
+/*************** Wi-Fi ***************/
 void connectWiFi(void) {
   WiFi.mode(WIFI_STA);                    // Set Wi-Fi to station mode
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);   // Start Wi-Fi connection
@@ -134,7 +134,8 @@ bool fbPatchTelemetry(unsigned long vWord,
   return (code >= 200 && code < 300);      // Return true on HTTP 2xx
 }
 
-/*************** Relay handling ***************/
+/*************** Relay handling with retries ***************/
+// This function will ensure the relay fetches every 300ms and tries fetching multiple times before polling.
 void handleRelay(void) {
   unsigned long now = millis();           // Get current time in ms
   if (now - g_lastRelayPollMs < g_relayPollIntervalMs) { // If not yet time to poll relay value
@@ -143,8 +144,18 @@ void handleRelay(void) {
   g_lastRelayPollMs = now;                // Update last poll time
 
   long relaysValue = 0;                   // Stores integer read from Firebase
-  if (!fbGetInt("/iot_data/relays.json", &relaysValue)) { // Read /iot_data/relays from Firebase
-    return;                               // If read fails, skip this cycle
+  bool relaySuccess = false;
+  for (int i = 0; i < 3; i++) {           // Try 3 times to fetch the relay data
+    relaySuccess = fbGetInt("/iot_data/relays.json", &relaysValue);
+    if (relaySuccess) {
+      break;                              // Break out of the loop if successful
+    }
+    delay(500);                           // Wait a bit before retrying
+  }
+
+  if (!relaySuccess) {                    // If all attempts fail, exit the function
+    Serial.println("[RELAY] Failed to fetch relay value from Firebase.");
+    return;
   }
 
   g_relayCmdByte = (unsigned char)(relaysValue & 0xFF); // Use lower 8 bits as command byte to STM32
