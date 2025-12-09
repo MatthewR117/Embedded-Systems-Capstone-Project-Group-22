@@ -20,7 +20,7 @@ unsigned char g_relayCmdByte = 0;
 
 // Relay Firebase failure handling
 short g_fbFailCount = 0;
-const short g_fbFailThreshold = 10;
+const short g_fbFailThreshold = 5;  // lower threshold so we recover faster
 
 // Telemetry receive buffer (16 bytes from STM32, header stripped)
 unsigned char g_telemBuf[16];
@@ -60,22 +60,34 @@ void connectWiFi(void) {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
+  Serial.print("[WIFI] Connecting");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
+    Serial.print(".");
   }
+  Serial.println();
+  Serial.print("[WIFI] Connected, IP: ");
+  Serial.println(WiFi.localIP());
 }
 
 /*************** Firebase helpers ***************/
 bool fbGetInt(const char *path, long *valueOut) {
   if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[FB] WiFi not connected in fbGetInt, reconnecting");
     connectWiFi();
   }
 
   HTTPClient http;
   String url = String(FIREBASE_HOST) + String(path) + String(FIREBASE_AUTH_SUFFIX);
 
+  Serial.print("[FB] GET ");
+  Serial.println(url);
+
   http.begin(g_client, url);
   int code = http.GET();
+
+  Serial.print("[FB] HTTP code: ");
+  Serial.println(code);
 
   if (code != HTTP_CODE_OK) {
     http.end();
@@ -86,11 +98,18 @@ bool fbGetInt(const char *path, long *valueOut) {
   http.end();
 
   body.trim();
+  Serial.print("[FB] Body: '");
+  Serial.print(body);
+  Serial.println("'");
+
   if (body.length() == 0 || body == "null") {
     return false;
   }
 
   long v = body.toInt();
+  Serial.print("[FB] Parsed int: ");
+  Serial.println(v);
+
   *valueOut = v;
   return true;
 }
@@ -129,7 +148,7 @@ bool fbPatchTelemetry(unsigned long vWord,
   return (code >= 200 && code < 300);
 }
 
-/*************** Relay handling with auto-recover ***************/
+/*************** Relay handling with diagnostics ***************/
 void handleRelay(void) {
   unsigned long now = millis();
   if (now - g_lastRelayPollMs < g_relayPollIntervalMs) {
@@ -141,11 +160,15 @@ void handleRelay(void) {
   if (!fbGetInt("/iot_data/relays.json", &relaysValue)) {
     g_fbFailCount++;
 
+    Serial.print("[RELAY] fbGetInt FAILED, count=");
+    Serial.println(g_fbFailCount);
+
     if (g_fbFailCount >= g_fbFailThreshold) {
-      Serial.println("[RELAY] fbGetInt failed repeatedly, resetting WiFi");
+      Serial.println("[RELAY] fbGetInt failed repeatedly, resetting WiFi and client");
       WiFi.disconnect(true);
-      delay(100);
+      delay(200);
       connectWiFi();
+      g_client.stop();   // reset TLS client
       g_fbFailCount = 0;
     }
     return;
